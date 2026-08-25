@@ -1,5 +1,6 @@
-# Fixing-File-Type-Handling-in-Zoho-Agent-Studio-Document-Agents
-A custom tool in Zoho's Agent Studio returns unreadable binary and raw bytes for Excel and Image files. This approach fixes the output for Excel Files and allows an agent to read and extract from them natively and efficiently.
+# Fixing File-Type Handling in Zoho Agent Studio Document Agents
+
+How to diagnose and fix a silent Agent Studio platform limitation: when an agent downloads a file through a custom tool, **PDF and DOCX content comes back as clean readable text automatically — but XLSX and image files come back as raw, unreadable binary**, with no error and no warning. This documents the diagnosis, and a working fix for the Excel case using a custom **Zoho Catalyst** microservice.
 
 ---
 
@@ -99,7 +100,9 @@ Catalyst's **Connections** component (Cloud Scale → Connections) was used rath
 
 **Gotcha found during build (auth shape):** `getConnectionCredentials()` doesn't return a bare access token — it returns `{ headers, parameters }`, i.e. **ready-made request headers** with the `Authorization` value already formatted. The fix was to spread `cred.headers` straight into the `fetch` call instead of hunting for an `access_token` field.
 
-### Function code (core logic, auth-corrected version)
+### Function code — first working version (auth fixed, no pagination or hidden-row handling yet)
+
+This was the version that first proved the WorkDrive Connection + SheetJS pipeline worked end to end:
 
 ```javascript
 "use strict";
@@ -112,7 +115,7 @@ const app = express();
 app.use(express.json());
 
 const CONNECTION_NAME = "zohoworkdrive";
-const MAX_ROWS_PER_SHEET = 500; // later raised to 2000 with pagination — see below
+const MAX_ROWS_PER_SHEET = 500; // later raised and made caller-configurable — see below
 
 // Health check
 app.get("/", (req, res) => {
@@ -196,16 +199,195 @@ app.post("/extract-excel", async (req, res) => {
 module.exports = app;
 ```
 
-### Enhancements added after the version above (confirmed working, exact final source not fully captured)
+### Function code — final deployed version (v5.0)
 
-Tested and verified against a real ~8,800-row exported spreadsheet before being wired into the agent:
+This is the exact production source, confirmed working:
 
-- **Real dates, not Excel serials** — `cellDates: true` + `raw: false` in the parse options. Verified a raw serial like `43367.47` renders as an actual date instead of a float.
-- **Proper CSV escaping** — commas and quotes inside cell values no longer break column alignment (verified with a value containing an embedded comma).
-- **Pagination** — row cap raised from 500 to **2,000 per call**, with `has_more` / `next_start_row` in the response so a large sheet is fetched in pages instead of silently truncated.
-- **`columns` returned separately** from the data rows, so the schema is known up front, including on later pages.
-- **`summary_only: true` mode** — returns just the column list, row count, and 5 sample rows. A cheap way to preview a workbook before pulling the full data.
-- **`visible_rows_only` flag** — respects a workbook's saved Excel filter/hidden rows by default; the response separately reports `total_data_rows` (visible), `underlying_data_rows` (including hidden/filtered), and `hidden_rows_excluded`.
+```javascript
+"use strict";
+
+const express = require("express");
+const catalyst = require("zcatalyst-sdk-node");
+const XLSX = require("./vendor/xlsx.full.min.js");
+
+const app = express();
+app.use(express.json());
+
+const CONNECTION_NAME = "zohoworkdrive";
+const DEFAULT_MAX_ROWS = 2000;
+const HARD_MAX_ROWS = 10000;
+
+const SHEET_TO_JSON_OPTIONS = {
+	header: 1,
+	blankrows: false,
+	defval: "",
+	raw: false,
+	dateNF: "yyyy-mm-dd hh:mm:ss"
+};
+
+// Wrap a cell value for safe CSV output
+function csvCell(v) {
+	if (v === null || v === undefined) return "";
+	let s = String(v);
+	if (s.indexOf('"') !== -1) s = s.replace(/"/g, '""');
+	if (/[",\n\r]/.test(s)) s = '"' + s + '"';
+	return s;
+}
+
+app.get("/", (req, res) => {
+	res.status(200).json({
+		status: "success",
+		message: "Excel Extractor is live and ready.",
+		excel_parser_version: XLSX.version,
+		extractor_version: "5.0",
+		supports_visible_rows_only: true
+	});
+});
+
+app.post("/extract-excel", async (req, res) => {
+	const file_id = req.body ? req.body.file_id : null;
+
+	// Optional overrides from the caller
+	let maxRows = req.body && req.body.max_rows ? parseInt(req.body.max_rows, 10) : DEFAULT_MAX_ROWS;
+	if (isNaN(maxRows) || maxRows < 1) maxRows = DEFAULT_MAX_ROWS;
+	if (maxRows > HARD_MAX_ROWS) maxRows = HARD_MAX_ROWS;
+
+	const startRow = req.body && req.body.start_row ? Math.max(0, parseInt(req.body.start_row, 10)) : 0;
+	const summaryOnly = req.body && req.body.summary_only === true;
+	const visibleRowsOnly = req.body && req.body.visible_rows_only === true;
+
+	if (!file_id) {
+		return res.status(400).json({
+			status: "error",
+			message: "file_id is required."
+		});
+	}
+
+	try {
+		const capp = catalyst.initialize(req);
+		const connections = capp.connections();
+		const cred = await connections.getConnectionCredentials(CONNECTION_NAME);
+
+		if (!cred || !cred.headers) {
+			return res.status(500).json({
+				status: "error",
+				message: "Connection returned no authorization headers."
+			});
+		}
+
+		const url = "https://www.zohoapis.com/workdrive/api/v1/download/" + file_id;
+		const wdRes = await fetch(url, {
+			method: "GET",
+			headers: Object.assign({}, cred.headers)
+		});
+
+		if (!wdRes.ok) {
+			const body = await wdRes.text();
+			return res.status(502).json({
+				status: "error",
+				message: "WorkDrive download failed.",
+				http_status: wdRes.status,
+				detail: body.slice(0, 500)
+			});
+		}
+
+		const buffer = Buffer.from(await wdRes.arrayBuffer());
+
+		// cellDates converts Excel serial numbers into real Date objects
+		// cellStyles is required for SheetJS to preserve Excel row visibility.
+		const wb = XLSX.read(buffer, {
+			type: "buffer",
+			cellDates: true,
+			cellStyles: true
+		});
+
+		const sheets = wb.SheetNames.map(function (name) {
+			const ws = wb.Sheets[name];
+
+			// Count every underlying row for transparent reporting.
+			const allRows = XLSX.utils.sheet_to_json(ws, SHEET_TO_JSON_OPTIONS);
+
+			// skipHidden normally removes hidden columns too. Use a shallow copy
+			// without column metadata so visible_rows_only affects rows only.
+			let rows = allRows;
+			if (visibleRowsOnly) {
+				const rowFilteredSheet = Object.assign({}, ws);
+				delete rowFilteredSheet["!cols"];
+				rows = XLSX.utils.sheet_to_json(rowFilteredSheet, Object.assign({},
+					SHEET_TO_JSON_OPTIONS,
+					{ skipHidden: true }
+				));
+			}
+
+			const headerRow = rows.length > 0 ? rows[0] : [];
+			const dataRows = rows.slice(1);
+			const underlyingDataRows = allRows.length > 0 ? allRows.slice(1) : [];
+
+			const sheetInfo = {
+				sheet_name: name,
+				columns: headerRow.map(function (h) { return String(h); }),
+				total_data_rows: dataRows.length,
+				underlying_data_rows: underlyingDataRows.length,
+				hidden_rows_excluded: visibleRowsOnly
+					? Math.max(0, underlyingDataRows.length - dataRows.length)
+					: 0,
+				visible_rows_only: visibleRowsOnly
+			};
+
+			if (summaryOnly) {
+				sheetInfo.sample_rows = dataRows.slice(0, 5).map(function (r) {
+					return r.map(csvCell).join(",");
+				});
+				return sheetInfo;
+			}
+
+			const slice = dataRows.slice(startRow, startRow + maxRows);
+			sheetInfo.start_row = startRow;
+			sheetInfo.rows_returned = slice.length;
+			sheetInfo.has_more = startRow + slice.length < dataRows.length;
+			sheetInfo.next_start_row = sheetInfo.has_more ? startRow + slice.length : null;
+			sheetInfo.csv = [headerRow.map(csvCell).join(",")]
+				.concat(slice.map(function (r) { return r.map(csvCell).join(","); }))
+				.join("\n");
+
+			return sheetInfo;
+		});
+
+		return res.status(200).json({
+			status: "success",
+			file_id: file_id,
+			format: "xlsx",
+			mode: summaryOnly ? "summary" : "rows",
+			row_scope: visibleRowsOnly ? "visible_only" : "all_rows",
+			sheet_count: sheets.length,
+			sheets: sheets
+		});
+	} catch (err) {
+		return res.status(500).json({
+			status: "error",
+			message: "Extraction failed.",
+			detail: err && err.message ? err.message : String(err)
+		});
+	}
+});
+
+module.exports = app;
+```
+
+### What changed between the two versions, and why
+
+- **Real dates, not Excel serials.** `cellDates: true` on `XLSX.read`, combined with `raw: false` and `dateNF: "yyyy-mm-dd hh:mm:ss"` in the row-conversion options. A raw serial like `43367.47` now renders as a formatted date string instead of a float.
+- **Proper CSV escaping**, via a dedicated `csvCell()` helper: doubles embedded quote characters and wraps any value containing a comma, quote, or newline in quotes. Replaces the earlier version's naive `r.join(",")`, which broke on any cell containing a comma.
+- **Pagination**, via `start_row` (caller-supplied offset) and a response `has_more` / `next_start_row` pair — default page size **2,000 rows**, hard-capped at **10,000** even if a caller requests more.
+- **`columns` returned separately** from the data rows (the header row is parsed out and never appears inside `csv`), so the schema is known up front, including on later pages.
+- **`summary_only: true` mode** — skips pagination entirely and returns just `columns`, `total_data_rows`, and 5 CSV-escaped `sample_rows`. Cheap way to preview a workbook before requesting the full data.
+- **`visible_rows_only` flag**, implemented as a genuine two-pass parse rather than a simple filter:
+  1. The sheet is parsed once normally (`allRows`) to get the true underlying row count.
+  2. If `visible_rows_only` is requested, the sheet's `!cols` metadata is stripped from a shallow copy first, then it's re-parsed with SheetJS's `skipHidden` option. Stripping `!cols` first matters because `skipHidden` on its own also drops hidden *columns* — this makes it affect only hidden/filtered *rows*.
+  3. `cellStyles: true` on the original `XLSX.read` call is required for step 2 to have any visibility metadata to work from at all — without it, SheetJS has no record of which rows are hidden.
+  4. `hidden_rows_excluded` is then just the difference between the two row counts.
+- **`row_scope` and `mode`** added at the top level of the response (`"visible_only"`/`"all_rows"`, `"summary"`/`"rows"`) so the caller doesn't have to infer what was requested from the shape of the response.
+- **Health check enriched** with `extractor_version` and `supports_visible_rows_only`, so a caller (or a human checking the Invocation URL) can confirm which capabilities are actually deployed without reading the source.
 
 The tool was wired into Agent Studio as **`extractWorkDriveExcel`**, replacing an earlier instruction line that told the agent it simply couldn't read spreadsheets.
 
@@ -250,18 +432,20 @@ The critical piece that makes this safe isn't just having the right tool — it'
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `file_id` | string | yes | WorkDrive file ID (top-level `id` from `listFolderFiles`, not the folder ID) |
-| `summary_only` | boolean | no | If `true`, returns only columns, row count, and 5 sample rows |
-| `visible_rows_only` | boolean | no | If `true` (recommended default), honors the workbook's saved Excel filter and excludes hidden/filtered rows |
-| `start_row` | integer | no | Pagination offset |
-| `max_rows` | integer | no | Page size, up to 2,000 |
+| `summary_only` | boolean | no | If `true`, returns only `columns`, row counts, and 5 sample rows — no pagination fields |
+| `visible_rows_only` | boolean | no | If `true`, excludes rows hidden or filtered out in the saved workbook (see the two-pass parsing note above) |
+| `start_row` | integer | no | Pagination offset into the data rows (0-indexed); default `0` |
+| `max_rows` | integer | no | Page size; default **2,000**, hard-capped at **10,000** regardless of what's requested |
 
-**Response (full pull):**
+**Response (full pull, `summary_only` omitted):**
 
 ```json
 {
   "status": "success",
   "file_id": "gqi4c...",
   "format": "xlsx",
+  "mode": "rows",
+  "row_scope": "visible_only",
   "sheet_count": 1,
   "sheets": [
     {
@@ -270,6 +454,8 @@ The critical piece that makes this safe isn't just having the right tool — it'
       "total_data_rows": 8791,
       "underlying_data_rows": 8791,
       "hidden_rows_excluded": 0,
+      "visible_rows_only": true,
+      "start_row": 0,
       "rows_returned": 2000,
       "has_more": true,
       "next_start_row": 2000,
@@ -287,15 +473,31 @@ The critical piece that makes this safe isn't just having the right tool — it'
   "file_id": "gqi4cfacac9e5b9fd451fa023664c6509638d",
   "format": "xlsx",
   "mode": "summary",
+  "row_scope": "all_rows",
   "sheet_count": 1,
   "sheets": [
     {
       "sheet_name": "Sheet0",
       "columns": ["Column A", "Column B", "Column C", "..."],
       "total_data_rows": 8791,
-      "sample_rows": ["...5 sample rows..."]
+      "underlying_data_rows": 8791,
+      "hidden_rows_excluded": 0,
+      "visible_rows_only": false,
+      "sample_rows": ["...5 CSV-escaped sample rows..."]
     }
   ]
+}
+```
+
+**Health check response:**
+
+```json
+{
+  "status": "success",
+  "message": "Excel Extractor is live and ready.",
+  "excel_parser_version": "0.20.3",
+  "extractor_version": "5.0",
+  "supports_visible_rows_only": true
 }
 ```
 
@@ -310,6 +512,8 @@ The critical piece that makes this safe isn't just having the right tool — it'
 | `getConnectionCredentials()` shape | Returns `{ headers, parameters }` (ready-made request headers), not a bare access token |
 | SheetJS distribution | No longer on public npm — must be vendored as a single bundled file, kept manually alongside `package.json` |
 | Separate auth per runtime | A Catalyst function's Connection is entirely separate from an Agent Studio custom tool's Connection, even with the same name and scope — set up twice, in two different consoles |
+| `skipHidden` also drops hidden columns | SheetJS's `skipHidden` option filters hidden columns as well as hidden rows. To get row-only filtering, the sheet's `!cols` metadata must be stripped before re-parsing with `skipHidden` — otherwise a workbook with any hidden column silently loses that column's data even when the caller only asked to exclude hidden rows |
+| `cellStyles: true` is a prerequisite, not optional | SheetJS only preserves row-visibility metadata when `cellStyles: true` is passed to `XLSX.read`. Without it, `skipHidden` has nothing to check against and hidden-row filtering silently does nothing |
 
 ## Verified test results
 
@@ -324,5 +528,5 @@ The critical piece that makes this safe isn't just having the right tool — it'
 
 - Images remain explicitly out of scope (no OCR path built).
 - Scanned (image-only) PDFs are untested through this specific pipeline; separately confirmed that Agent Studio's native PDF handling has no OCR, so a scanned PDF likely returns empty content the same way an image would.
-- The exact final `index.js` for the pagination/hidden-rows/date-formatting version wasn't fully captured verbatim in this write-up (reconstructed from verified behavior + partial code); pull the deployed ZIP from Catalyst directly if a byte-exact copy is needed for the repo.
+- Multi-sheet workbooks: pagination/`start_row`/`max_rows` currently apply uniformly across all sheets in one request rather than per-sheet — worth checking behavior on a workbook with sheets of very different sizes.
 - Worth periodically checking the connected LLM's usage/credit limits before heavy Excel-testing sessions, since large sheets mean more tokens per answer.
